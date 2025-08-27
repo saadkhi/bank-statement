@@ -1,0 +1,27 @@
+# docker-compose.yml (Corrected)
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: account_statement_backend
+    volumes:
+      - ./media:/app/media
+      - ./db.sqlite3:/app/db.sqlite3
+    ports:
+      - "8000:8000"
+    environment:
+      - DJANGO_SETTINGS_MODULE=mybackend.settings
+    # REMOVED: - depends_on: frontend  <-- This line caused the circular dependency
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: account_statement_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend # This dependency is correct (frontend needs backend APIs)
