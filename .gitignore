@@ -1,0 +1,44 @@
+# Python virtual environments
+venv/
+.env/
+*.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# VS Code settings
+.vscode/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Package directories
+Account_Statement/accounts/__pycache__/
+Account_Statement/accounts/*.egg-info/
+Account_Statement/accounts/build/
+Account_Statement/accounts/dist/
+
+# Hugging Face cache
+~/.cache/huggingface/
+
+# PDF and image outputs
+*.pdf
+*.jpg
+*.jpeg
+*.png
+
+# Logs
+*.log
+
+# Ignore secrets
+*.secret
+*.token
+
+# Ignore test results
+test-

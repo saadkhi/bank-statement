@@ -1,20 +1,53 @@
-import pdfplumber
-import re
-import time
+import io, os, json, re, base64, time
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Generator
 import statistics
 
-# Import the combine extraction logic (adjust paths as needed)
-from accounts.new_scrappers.combine_scrapper import run_scraper1, run_scraper2, run_scraper3, run_scraper4, run_scraper5, run_scraper6, run_scraper7
+# Conditional imports for OCR functionality
+try:
+    from PIL import Image
+    import fitz
+    from huggingface_hub import InferenceClient
+    from concurrent.futures import ThreadPoolExecutor
+    from functools import partial
+    OCR_AVAILABLE = True
+
+    # ---------- Config ----------
+    MODEL_ID      = "no model"
+    HF_TOKEN      = "no code"
+
+    # ---------- Hugging Face client ----------
+    client = InferenceClient(provider="fireworks-ai", api_key=HF_TOKEN)
+
+    # ---------- Helper: PDF → JPEG ----------
+    def pdf_to_images(pdf_path, dpi=150):
+        doc = fitz.open(pdf_path)
+        images = []
+        for page in doc:
+            pix = page.get_pixmap(dpi=dpi)
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            images.append(img)
+        doc.close()
+        return images
+
+except ImportError:
+    OCR_AVAILABLE = False
+    print("Warning: OCR dependencies not available. Using fallback text extraction.")
+
+    # Define dummy functions when OCR is not available
+    def pdf_to_images(pdf_path, dpi=150):
+        return []
+
+    client = None
+    MODEL_ID = ""
+    HF_TOKEN = ""
 
 @dataclass
 class Transaction:
-    """Optimized transaction data structure"""
+    """Transaction data structure"""
     date: str
     description: str
     debit: float = 0.0
@@ -24,7 +57,7 @@ class Transaction:
 
 @dataclass
 class MonthlyData:
-    """Optimized monthly analysis data structure"""
+    """Monthly analysis data structure"""
     opening_balance: float = 0.0
     closing_balance: float = 0.0
     total_credit: float = 0.0
@@ -40,358 +73,407 @@ class MonthlyData:
     transaction_count: int = 0
     balances: List[float] = field(default_factory=list)
 
-class BankStatementExtractor:
-    """Enhanced bank statement extractor integrating combine_scrapper.py scrapers with complete analytics"""
-    
-    # Pre-compiled constants
-    ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-    ARABIC_CHARS_PATTERN = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
-    ENGLISH_CHARS_PATTERN = re.compile(r"[A-Za-z]")
-    WHITESPACE_PATTERN = re.compile(r"\s+")
-    
-    # International transaction keywords (compiled once)
-    INTL_KEYWORDS = frozenset(["international", "swift", "wire", "transfer", "intl"])
-    
-    def __init__(self):
-        # List of scraper functions from combine_scrapper.py
-        self.scrapers = [
-            run_scraper1,
-            run_scraper2,
-            run_scraper3,
-            run_scraper4,
-            run_scraper5,
-            run_scraper6,
-            run_scraper7
-        ]
-        
-        # Pre-compile all regex patterns for fallback
-        self.field_patterns = self._compile_field_patterns()
-        self.transaction_patterns = self._compile_transaction_patterns()
-        self.date_formats = [
-            "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d",
-            "%d-%m-%Y", "%m-%d-%Y", "%Y-%m-%d",
-            "%d/%m/%y", "%m/%d/%y", "%y/%m/%d"
-        ]
-        
-        # Number extraction pattern
-        self.number_pattern = re.compile(r'[\d,]+\.?\d*')
-        self.date_pattern = re.compile(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}')
+# ---------- Prompt ----------
+SYSTEM_RULES = (
+    "You are a precise bank statement parser.\n"
+    "The table columns are in this order:\n"
+    "Balance | Credit | Debit | Transaction Description | Date.\n\n"
+    "OUTPUT FORMAT:\n"
+    "{\n"
+    "  \"account_holder_name\": \"...\",\n"
+    "  \"account_number\": \"...\",\n"
+    "  \"id_or_iqama_number\": \"...\",\n"
+    "  \"transactions\": [\n"
+    "    {\n"
+    "      \"date\": \"YYYY-MM-DD\",\n"
+    "      \"credit\": \"123.45\" or \"\",\n"
+    "      \"debit\": \"123.45\" or \"\",\n"
+    "      \"transaction_description\": \"...\"\n"
+    "    }\n"
+    "  ]\n"
+    "}\n\n"
+    "Rules:\n"
+    "- Extract account_holder_name, account_number, id_or_iqama_number if present at top of statement.\n"
+    "- For each transaction row:\n"
+    "   • Use the Date from the rightmost column.\n"
+    "   • Take Credit from Credit column, Debit from Debit column.\n"
+    "   • Exactly one of credit or debit must be non-empty.\n"
+    "   • Normalize amounts with 2 decimals.\n"
+    "   • Never include Balance.\n"
+    "Return ONLY valid JSON following the above schema."
+)
 
-    def _compile_field_patterns(self) -> Dict[str, Dict[str, re.Pattern]]:
-        """Pre-compile field extraction patterns"""
-        raw_patterns = {
-            "en": {
-                "customer_name": r"Customer Name\s+([^\n]+)",
-                "city": r"City\s+([^\n]+)",
-                "account_number": r"Account Number\s+(\d+)",
-                "iban_number": r"IBAN Number\s+([A-Z0-9]+)",
-                "opening_balance": r"Opening Balance\s+([\d,]+\.?\d*)\s*SAR",
-                "closing_balance": r"Closing Balance\s+([\d,]+\.?\d*)\s*SAR",
-                "financial_period": r"On The Period\s+([\d/]+\s*-\s*[\d/]+)"
-            },
-            "ar": {
-                "customer_name": r"(?:اسم العميل|Customer Name)\s+([^\n]+)",
-                "city": r"(?:المدينة|City)\s+([^\n]+)",
-                "account_number": r"(?:رقم الحساب|Account Number)\s+(\d+)",
-                "iban_number": r"(?:رقم الآيبان|IBAN Number)\s+([A-Z0-9]+)",
-                "opening_balance": r"(?:الرصيد.*?الإفتتاحي|Opening Balance)\s+([\d,]+\.?\d*)\s*(?:SAR|ر\.س)",
-                "closing_balance": r"(?:الرصيد.*?الإقفال|Closing Balance)\s+([\d,]+\.?\d*)\s*(?:SAR|ر\.س)",
-                "financial_period": r"(?:خلال الفترة|On The Period)\s+([\d/]+\s*-\s*[\d/]+)"
-            }
-        }
-        
-        return {
-            lang: {
-                key: re.compile(pattern, re.IGNORECASE | re.MULTILINE | re.DOTALL)
-                for key, pattern in patterns.items()
-            }
-            for lang, patterns in raw_patterns.items()
-        }
+# ---------- Helper: encode image ----------
+def encode_image(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    buf.seek(0)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.read()).decode()
 
-    def _compile_transaction_patterns(self) -> Dict[str, List[re.Pattern]]:
-        """Pre-compile transaction extraction patterns"""
-        en_patterns = [
-            r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(.+?)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)",
-            r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(.+?)\s+([\d,]+\.?\d*)\s*(?:SAR)?\s+([\d,]+\.?\d*)\s*(?:SAR)?\s+([\d,]+\.?\d*)\s*(?:SAR)?",
-            r"(\d{2,4}[/-]\d{1,2}[/-]\d{1,2})\s+(.+?)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)"
-        ]
-        
-        ar_patterns = [
-            r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(.+?)\s+([\d,]+\.?\d*)\s*(?:ر\.س)?\s+([\d,]+\.?\d*)\s*(?:ر\.س)?\s+([\d,]+\.?\d*)\s*(?:ر\.س)?",
-            r"(\d{2,4}[/-]\d{1,2}[/-]\d{1,2})\s+(.+?)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)"
-        ]
-        
-        return {
-            "en": [re.compile(p, re.IGNORECASE) for p in en_patterns],
-            "ar": [re.compile(p, re.IGNORECASE) for p in ar_patterns]
-        }
+# ---------- Robust JSON extraction ----------
+def extract_json_object(text: str):
+    text = text.strip()
 
-    @lru_cache(maxsize=128)
-    def normalize_arabic_text(self, txt: str) -> str:
-        """Cached Arabic text normalization"""
-        return self.WHITESPACE_PATTERN.sub(" ", txt.translate(self.ARABIC_DIGITS)).strip()
+    # Remove code fences
+    text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"```$", "", text, flags=re.IGNORECASE).strip()
 
-    @lru_cache(maxsize=32)
-    def detect_language(self, text_sample: str) -> str:
-        """Optimized language detection using sample"""
-        sample = text_sample[:1000]
-        
-        arabic_count = len(self.ARABIC_CHARS_PATTERN.findall(sample))
-        english_count = len(self.ENGLISH_CHARS_PATTERN.findall(sample))
-        
-        return "ar" if arabic_count > english_count else "en"
+    # Try direct load
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
 
-    def parse_account_summary(self, text: str) -> Dict[str, any]:
-        """Optimized account summary parsing"""
-        lang = self.detect_language(text)
-        patterns = self.field_patterns[lang]
-        summary = {}
-        
-        for key, pattern in patterns.items():
-            match = pattern.search(text)
-            if match:
-                val = match.group(1).strip()
-                
-                if key == "customer_name" and lang == "ar" and "اسم العميل" in val:
-                    parts = val.split("اسم العميل")
-                    summary[key] = " ".join(reversed(parts)).strip()
-                elif key in {"opening_balance", "closing_balance"}:
-                    try:
-                        summary[key] = float(val.replace(",", ""))
-                    except ValueError:
-                        summary[key] = 0.0
-                else:
-                    summary[key] = val
-        
-        return summary
+    # Try JSON block inside text
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
 
-    def _combine_extract(self, pdf_path: str) -> Dict[str, any]:
-        """Run all scrapers sequentially and return the first successful result"""
-        for scraper in self.scrapers:
-            try:
-                result = scraper(pdf_path)
-                if result and result.get("total_transactions", 0) > 0:
-                    print(f"✅ Success with {result['total_transactions']} transactions using {scraper.__name__}")
-                    return result
-            except Exception as e:
-                print(f"❌ {scraper.__name__} failed: {e}")
-        print("❌ All scrapers failed or found no transactions.")
+    # Fallback if all fails
+    return {"transactions": []}
+
+# ---------- Normalization ----------
+def norm_amount(value):
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return f"{float(value):.2f}"
+    s = str(value)
+    m = re.search(r"-?\d+(?:\.\d+)?", s.replace(",", ""))
+    return f"{float(m.group(0)):.2f}" if m else ""
+
+def normalize_transaction(row):
+    r = {k.strip().lower(): v for k, v in row.items()}
+    out = {
+        "date": str(r.get("date", "")).strip(),
+        "credit": norm_amount(r.get("credit", "")),
+        "debit": norm_amount(r.get("debit", "")),
+        "transaction_description": str(
+            r.get("transaction description", r.get("transaction_description", r.get("description", "")))
+        ).strip(),
+    }
+    # Ensure only one side populated
+    if out["credit"] and out["debit"]:
+        c, d = float(out["credit"]), float(out["debit"])
+        if c >= d:
+            out["debit"] = ""
+        else:
+            out["credit"] = ""
+    # Date cleanup
+    dm = re.search(r"\d{4}-\d{2}-\d{2}", out["date"])
+    if dm:
+        out["date"] = dm.group(0)
+    return out
+
+# ---------- Main page processor ----------
+def process_single_page(img, page_no, total):
+    print(f"Processing page {page_no}/{total} …")
+    data_url = encode_image(img)
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_ID,
+            messages=[
+                {"role": "system", "content": SYSTEM_RULES},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Extract all details and transactions from this statement."},
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                ]}
+            ],
+            temperature=0,
+            max_tokens=3072,
+            response_format={"type": "json_object"}   # ✅ force JSON output
+        )
+        raw_text = resp.choices[0].message["content"]
+
+        return extract_json_object(raw_text)
+
+    except Exception as e:
+        print(f"[WARN] Failed parsing page {page_no}: {e}")
+        return {"transactions": []}
+
+def aggregate_monthly_analysis(transactions: List[Transaction]) -> Dict[str, MonthlyData]:
+    """Monthly analysis aggregation"""
+    if not transactions:
         return {}
 
-    @lru_cache(maxsize=1000)
-    def parse_date_cached(self, date_str: str) -> datetime:
-        """Cached date parsing for better performance"""
-        for fmt in self.date_formats:
-            try:
-                return datetime.strptime(date_str, fmt)
-            except ValueError:
-                continue
-        
-        print(f"Could not parse date: {date_str}")
-        return datetime.now()
+    # Sort once using built-in sort
+    transactions.sort(key=lambda x: parse_date_for_sorting(x.date))
 
-    def aggregate_monthly_analysis(self, transactions: List[Transaction]) -> Dict[str, MonthlyData]:
-        """Optimized monthly analysis with dataclasses - FROM OLD CODE"""
-        if not transactions:
-            return {}
-        
-        # Sort once using built-in sort
-        transactions.sort(key=lambda x: self.parse_date_cached(x.date))
-        
-        monthly_data = defaultdict(MonthlyData)
-        
-        for tx in transactions:
-            try:
-                date = self.parse_date_cached(tx.date)
-                month_key = date.strftime("%b")
-                
-                data = monthly_data[month_key]
-                data.transaction_count += 1
-                data.total_credit += tx.credit
-                data.total_debit += tx.debit
-                data.closing_balance = tx.balance
-                data.minimum_balance = min(data.minimum_balance, tx.balance)
-                data.maximum_balance = max(data.maximum_balance, tx.balance)
-                data.balances.append(tx.balance)
-                
-                # Optimized international transaction detection
-                desc_lower = tx.description.lower()
-                if any(keyword in desc_lower for keyword in self.INTL_KEYWORDS):
-                    if tx.credit > 0:
-                        data.international_inward_count += 1
-                        data.international_inward_total += tx.credit
-                    if tx.debit > 0:
-                        data.international_outward_count += 1
-                        data.international_outward_total += tx.debit
-                        
-            except Exception as e:
-                print(f"Error processing transaction: {e}")
-                continue
-        
-        # Calculate derived metrics in batch
-        self._calculate_monthly_metrics(monthly_data)
-        
-        return dict(monthly_data)
+    monthly_data = defaultdict(MonthlyData)
 
-    def _calculate_monthly_metrics(self, monthly_data: Dict[str, MonthlyData]) -> None:
-        """Calculate monthly metrics in batch - FROM OLD CODE"""
-        prev_balance = 0
-        
-        # Sort months by chronological order
-        sorted_months = sorted(monthly_data.keys(), 
-                             key=lambda x: datetime.strptime(x, "%b").month)
-        
-        for month in sorted_months:
-            data = monthly_data[month]
-            data.opening_balance = prev_balance if prev_balance > 0 else data.closing_balance
-            data.net_change = data.total_credit - data.total_debit
-            
-            # Optimized fluctuation calculation
-            if len(data.balances) > 1:
-                mean_balance = statistics.mean(data.balances)
-                if mean_balance != 0:
-                    data.fluctuation = statistics.stdev(data.balances) / mean_balance * 100
-                else:
-                    data.fluctuation = 0
+    for tx in transactions:
+        try:
+            date = parse_date_for_sorting(tx.date)
+            month_key = date.strftime("%b")
+
+            data = monthly_data[month_key]
+            data.transaction_count += 1
+            data.total_credit += tx.credit
+            data.total_debit += tx.debit
+            data.closing_balance = tx.balance
+            data.minimum_balance = min(data.minimum_balance, tx.balance)
+            data.maximum_balance = max(data.maximum_balance, tx.balance)
+            data.balances.append(tx.balance)
+
+            # International transaction detection
+            desc_lower = tx.description.lower()
+            if any(keyword in desc_lower for keyword in ["international", "swift", "wire", "transfer", "intl"]):
+                if tx.credit > 0:
+                    data.international_inward_count += 1
+                    data.international_inward_total += tx.credit
+                if tx.debit > 0:
+                    data.international_outward_count += 1
+                    data.international_outward_total += tx.debit
+
+        except Exception as e:
+            print(f"Error processing transaction: {e}")
+            continue
+
+    # Calculate derived metrics in batch
+    _calculate_monthly_metrics(monthly_data)
+
+    return dict(monthly_data)
+
+def _calculate_monthly_metrics(monthly_data: Dict[str, MonthlyData]) -> None:
+    """Calculate monthly metrics in batch"""
+    prev_balance = 0
+
+    # Sort months by chronological order
+    sorted_months = sorted(monthly_data.keys(),
+                          key=lambda x: datetime.strptime(x, "%b").month)
+
+    for month in sorted_months:
+        data = monthly_data[month]
+        data.opening_balance = prev_balance if prev_balance > 0 else data.closing_balance
+        data.net_change = data.total_credit - data.total_debit
+
+        # Fluctuation calculation
+        if len(data.balances) > 1:
+            mean_balance = statistics.mean(data.balances)
+            if mean_balance != 0:
+                data.fluctuation = statistics.stdev(data.balances) / mean_balance * 100
             else:
                 data.fluctuation = 0
-                
-            # Clean up temporary data
-            data.balances.clear()
-            
-            if data.minimum_balance == float('inf'):
-                data.minimum_balance = 0
-                
-            prev_balance = data.closing_balance
+        else:
+            data.fluctuation = 0
 
-    def calculate_analytics(self, transactions: List[Transaction], 
-                          monthly_data: Dict[str, MonthlyData]) -> Dict[str, float]:
-        """Optimized analytics calculation - FROM OLD CODE"""
-        if not transactions or not monthly_data:
-            return self._empty_analytics()
-        
-        # Vectorized calculations where possible
-        monthly_values = list(monthly_data.values())
-        
-        total_inflow = sum(data.total_credit for data in monthly_values)
-        total_outflow = sum(data.total_debit for data in monthly_values)
-        
-        num_months = len(monthly_data)
-        avg_inflow = total_inflow / num_months
-        avg_outflow = total_outflow / num_months
-        
-        fluctuations = [data.fluctuation for data in monthly_values]
-        avg_fluctuation = statistics.mean(fluctuations) if fluctuations else 0
-        
-        stability = max(0, 100 - avg_fluctuation)
-        
-        # Optimized foreign transaction counting
-        foreign_count = sum(
-            data.international_inward_count + data.international_outward_count
-            for data in monthly_values
-        )
-        foreign_amount = sum(
-            data.international_inward_total + data.international_outward_total
-            for data in monthly_values
-        )
-        
-        # Count overdrafts efficiently
-        overdraft_count = sum(1 for tx in transactions if tx.balance < 0)
-        
-        return {
-            "average_fluctuation": round(avg_fluctuation, 2),
-            "net_cash_flow_stability": round(stability, 4),
-            "total_foreign_transactions": foreign_count,
-            "total_foreign_amount": round(foreign_amount, 2),
-            "overdraft_frequency": overdraft_count,
-            "overdraft_total_days": overdraft_count,
-            "sum_total_inflow": round(total_inflow, 2),
-            "sum_total_outflow": round(total_outflow, 2),
-            "avg_total_inflow": round(avg_inflow, 2),
-            "avg_total_outflow": round(avg_outflow, 2)
+        # Clean up temporary data
+        data.balances.clear()
+
+        if data.minimum_balance == float('inf'):
+            data.minimum_balance = 0
+
+        prev_balance = data.closing_balance
+
+def calculate_analytics(transactions: List[Transaction],
+                       monthly_data: Dict[str, MonthlyData]) -> Dict[str, float]:
+    """Analytics calculation"""
+    if not transactions or not monthly_data:
+        return _empty_analytics()
+
+    # Vectorized calculations where possible
+    monthly_values = list(monthly_data.values())
+
+    total_inflow = sum(data.total_credit for data in monthly_values)
+    total_outflow = sum(data.total_debit for data in monthly_values)
+
+    num_months = len(monthly_data)
+    avg_inflow = total_inflow / num_months
+    avg_outflow = total_outflow / num_months
+
+    fluctuations = [data.fluctuation for data in monthly_values]
+    avg_fluctuation = statistics.mean(fluctuations) if fluctuations else 0
+
+    stability = max(0, 100 - avg_fluctuation)
+
+    # Foreign transaction counting
+    foreign_count = sum(
+        data.international_inward_count + data.international_outward_count
+        for data in monthly_values
+    )
+    foreign_amount = sum(
+        data.international_inward_total + data.international_outward_total
+        for data in monthly_values
+    )
+
+    # Count overdrafts
+    overdraft_count = sum(1 for tx in transactions if tx.balance < 0)
+
+    return {
+        "average_fluctuation": round(avg_fluctuation, 2),
+        "net_cash_flow_stability": round(stability, 4),
+        "total_foreign_transactions": foreign_count,
+        "total_foreign_amount": round(foreign_amount, 2),
+        "overdraft_frequency": overdraft_count,
+        "overdraft_total_days": overdraft_count,
+        "sum_total_inflow": round(total_inflow, 2),
+        "sum_total_outflow": round(total_outflow, 2),
+        "avg_total_inflow": round(avg_inflow, 2),
+        "avg_total_outflow": round(avg_outflow, 2)
+    }
+
+def _empty_analytics() -> Dict[str, float]:
+    """Return empty analytics structure"""
+    return {
+        "average_fluctuation": 0.0,
+        "net_cash_flow_stability": 0.0,
+        "total_foreign_transactions": 0,
+        "total_foreign_amount": 0.0,
+        "overdraft_frequency": 0,
+        "overdraft_total_days": 0,
+        "sum_total_inflow": 0.0,
+        "sum_total_outflow": 0.0,
+        "avg_total_inflow": 0.0,
+        "avg_total_outflow": 0.0
+    }
+
+def parse_date_for_sorting(date_str: str) -> datetime:
+    """Parse date for sorting transactions"""
+    for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%m-%d-%Y"]:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return datetime.now()
+
+class BankStatementExtractor:
+    """Enhanced bank statement extractor using OCR with Hugging Face"""
+
+    def __init__(self):
+        self.ocr_available = OCR_AVAILABLE
+        if not self.ocr_available:
+            print("OCR not available, will use fallback text extraction")
+
+    def _fallback_text_extraction(self, pdf_path: str) -> Dict[str, any]:
+        """Fallback method using pdfplumber for text extraction"""
+        results = {
+            "pdf_file": str(Path(pdf_path).resolve()),
+            "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "pages_processed": 0,
+            "account_info": {},
+            "transactions": [],
+            "total_transactions": 0,
+            "monthly_analysis": {},
+            "analytics": {},
         }
 
-    def _empty_analytics(self) -> Dict[str, float]:
-        """Return empty analytics structure - FROM OLD CODE"""
-        return {
-            "average_fluctuation": 0.0,
-            "net_cash_flow_stability": 0.0,
-            "total_foreign_transactions": 0,
-            "total_foreign_amount": 0.0,
-            "overdraft_frequency": 0,
-            "overdraft_total_days": 0,
-            "sum_total_inflow": 0.0,
-            "sum_total_outflow": 0.0,
-            "avg_total_inflow": 0.0,
-            "avg_total_outflow": 0.0
-        }
+        try:
+            import pdfplumber
+        except ImportError:
+            # If pdfplumber is not available, return a basic structure with error info
+            print("Warning: pdfplumber not available. PDF processing will be limited.")
+            results["error"] = "PDF processing libraries not available. Please install pdfplumber and OCR dependencies for full functionality."
+            results["analytics"] = _empty_analytics()
+            results["processing_time"] = "0.00s"
+            return results
 
-    def extract_transactions_enhanced(self, text: str) -> List[Transaction]:
-        """Enhanced transaction extraction with optimizations - FALLBACK METHOD"""
-        lang = self.detect_language(text)
-        patterns = self.transaction_patterns[lang]
-        
-        print(f"Detected language: {lang}")
-        
-        best_transactions = []
-        max_found = 0
-        
-        # Try each compiled pattern
-        for pattern_idx, pattern in enumerate(patterns):
-            print(f"Trying pattern {pattern_idx + 1}...")
-            transactions = []
-            
-            for line_num, line in enumerate(text.split('\n')):
-                line = line.strip()
-                if not line:
-                    continue
-                
-                if lang == "ar":
-                    line = self.normalize_arabic_text(line)
-                
-                match = pattern.search(line)
-                if match:
-                    try:
-                        date, desc, debit_str, credit_str, balance_str = match.groups()
-                        
-                        # Optimized number conversion
-                        debit = self._safe_float_convert(debit_str)
-                        credit = self._safe_float_convert(credit_str)
-                        balance = self._safe_float_convert(balance_str)
-                        
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                pages_text = []
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        pages_text.append(page_text)
+
+                full_text = "\n".join(pages_text)
+                results["pages_processed"] = len(pdf.pages)
+
+                # Simple transaction extraction (basic implementation)
+                transactions = []
+                lines = full_text.split('\n')
+
+                for line_num, line in enumerate(lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Basic pattern matching for transactions
+                    # This is a simplified version - you may need to adjust patterns
+                    date_match = re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', line)
+                    amount_match = re.search(r'[\d,]+\.?\d*', line)
+
+                    if date_match and amount_match:
                         transactions.append(Transaction(
-                            date=date.strip(),
-                            description=desc.strip(),
-                            debit=debit,
-                            credit=credit,
-                            balance=balance,
+                            date=date_match.group(0),
+                            description=line,
+                            debit=0.0,
+                            credit=float(amount_match.group(0).replace(",", "")),
+                            balance=0.0,
                             line_number=line_num
                         ))
-                    except (ValueError, AttributeError) as e:
-                        print(f"Error parsing line {line_num}: {e}")
-                        continue
-            
-            print(f"Pattern {pattern_idx + 1} extracted {len(transactions)} transactions")
-            
-            if len(transactions) > max_found:
-                best_transactions = transactions
-                max_found = len(transactions)
-        
-        print(f"Final transaction count: {len(best_transactions)}")
-        return best_transactions
 
-    def _safe_float_convert(self, value_str: str) -> float:
-        """Safe and fast float conversion"""
-        try:
-            return float(value_str.replace(",", ""))
-        except (ValueError, AttributeError):
-            return 0.0
+                results["total_transactions"] = len(transactions)
+                results["transactions"] = [
+                    {
+                        "date": tx.date,
+                        "description": tx.description,
+                        "debit": tx.debit,
+                        "credit": tx.credit,
+                        "balance": tx.balance,
+                        "line_number": tx.line_number
+                    }
+                    for tx in transactions
+                ]
+
+                # Basic account info extraction
+                results["account_info"] = {
+                    "customer_name": "Unknown",
+                    "account_number": "Unknown",
+                    "iban_number": "",
+                    "opening_balance": 0.0,
+                    "closing_balance": 0.0,
+                    "financial_period": "",
+                }
+
+                # Generate basic analysis if transactions found
+                if results["total_transactions"] > 0:
+                    monthly_data = aggregate_monthly_analysis(transactions)
+                    results["monthly_analysis"] = {
+                        month: {
+                            "opening_balance": data.opening_balance,
+                            "closing_balance": data.closing_balance,
+                            "total_credit": data.total_credit,
+                            "total_debit": data.total_debit,
+                            "net_change": data.net_change,
+                            "fluctuation": data.fluctuation,
+                            "minimum_balance": data.minimum_balance,
+                            "maximum_balance": data.maximum_balance,
+                            "international_inward_count": data.international_inward_count,
+                            "international_outward_count": data.international_outward_count,
+                            "international_inward_total": data.international_inward_total,
+                            "international_outward_total": data.international_outward_total,
+                            "transaction_count": data.transaction_count
+                        }
+                        for month, data in monthly_data.items()
+                    }
+                    results["analytics"] = calculate_analytics(transactions, monthly_data)
+                else:
+                    results["analytics"] = _empty_analytics()
+
+        except Exception as e:
+            print(f"Error in fallback text extraction: {e}")
+            results["error"] = str(e)
+            results["analytics"] = _empty_analytics()
+
+        results["processing_time"] = f"{time.time() - time.time():.2f}s"
+        return results
 
     def process_bank_statement(self, pdf_path: str) -> Dict[str, any]:
-        """Main processing method using combined scrapers with fallback and complete analytics"""
+        """Main processing method - uses OCR if available, otherwise fallback"""
+        if self.ocr_available:
+            return self._process_bank_statement_ocr(pdf_path)
+        else:
+            print("Using fallback text extraction method")
+            return self._fallback_text_extraction(pdf_path)
+
+    def _process_bank_statement_ocr(self, pdf_path: str) -> Dict[str, any]:
+        """OCR-based processing method"""
         start = time.time()
         pdf_path_obj = Path(pdf_path).resolve()
-        
+
         results = {
             "pdf_file": str(pdf_path_obj),
             "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -404,72 +486,101 @@ class BankStatementExtractor:
         }
 
         try:
-            # Step 1: Try the combined scrapers
-            scraper_result = self._combine_extract(pdf_path)
-            
-            transactions = []  # Will hold Transaction objects for analysis
-            
-            if scraper_result and scraper_result.get("total_transactions", 0) > 0:
-                results["account_info"] = scraper_result.get("account_summary", {})
-                results["transactions"] = scraper_result["transactions"]  # List of dicts for output
-                results["total_transactions"] = scraper_result["total_transactions"]
-                results["pages_processed"] = scraper_result.get("total_pages", 0)
-                
-                # Convert to Transaction objects for internal analysis
-                transactions = [
-                    Transaction(
-                        date=tx.get("date", ""),
-                        description=tx.get("description", ""),
-                        debit=float(tx.get("debit", 0.0)),
-                        credit=float(tx.get("credit", 0.0)),
-                        balance=float(tx.get("balance", 0.0)),
-                        line_number=tx.get("line_number", 0)
-                    )
-                    for tx in results["transactions"]
-                    if all(key in tx for key in ["date", "description", "debit", "credit", "balance"])
-                ]
-                
-                print(f"Extracted {results['total_transactions']} transactions using combined scrapers")
-            else:
-                # Step 2: Fallback to original regex-based extraction
-                with pdfplumber.open(pdf_path) as pdf:
-                    pages_text = []
-                    for page in pdf.pages:
-                        page_text = page.extract_text()
-                        if page_text:
-                            pages_text.append(page_text)
-                    
-                    full_text = "\n".join(pages_text)
-                    results["pages_processed"] = len(pdf.pages)
-                    
-                    print(f"Processing {len(pdf.pages)} pages with fallback...")
-                    
-                    results["account_info"] = self.parse_account_summary(full_text)
-                    print(f"Account info extracted: {results['account_info']}")
-                    
-                    transactions = self.extract_transactions_enhanced(full_text)
-                    results["total_transactions"] = len(transactions)
-                    
-                    # Convert to dicts for output
-                    results["transactions"] = [
-                        {
-                            "date": tx.date,
-                            "description": tx.description,
-                            "debit": tx.debit,
-                            "credit": tx.credit,
-                            "balance": tx.balance,
-                            "line_number": tx.line_number
-                        }
-                        for tx in transactions
-                    ]
-                    
-                    print(f"Extracted {results['total_transactions']} transactions with fallback")
+            images = pdf_to_images(pdf_path)
+            results["pages_processed"] = len(images)
 
-            # Step 3: Generate analysis if transactions found (USING OLD CODE METHODS)
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                page_results = list(pool.map(
+                    partial(process_single_page, total=len(images)),
+                    images, range(1, len(images)+1)
+                ))
+
+            # Merge results
+            master = dict(account_holder_name="", account_number="", id_or_iqama_number="", transactions=[])
+            for parsed in page_results:
+                if not parsed:
+                    continue
+                for key in ["account_holder_name", "account_number", "id_or_iqama_number"]:
+                    val = parsed.get(key, "")
+                    if val and not master[key]:
+                        master[key] = val
+                txs = [normalize_transaction(x) for x in parsed.get("transactions", []) if isinstance(x, dict)]
+                master["transactions"].extend(txs)
+
+            # Convert OCR transactions to Transaction objects for analysis
+            transactions = []
+            for idx, tx in enumerate(master["transactions"]):
+                try:
+                    debit = float(tx.get("debit", 0) or 0)
+                    credit = float(tx.get("credit", 0) or 0)
+                    transactions.append(Transaction(
+                        date=tx.get("date", ""),
+                        description=tx.get("transaction_description", ""),
+                        debit=debit,
+                        credit=credit,
+                        balance=0.0,  # Will be calculated later
+                        line_number=idx
+                    ))
+                except (ValueError, TypeError):
+                    continue
+
+            results["total_transactions"] = len(transactions)
+
+            # Convert to dicts for output
+            results["transactions"] = [
+                {
+                    "date": tx.date,
+                    "description": tx.description,
+                    "debit": tx.debit,
+                    "credit": tx.credit,
+                    "balance": tx.balance,
+                    "line_number": tx.line_number
+                }
+                for tx in transactions
+            ]
+
+            # Map account info
+            results["account_info"] = {
+                "customer_name": master.get("account_holder_name", ""),
+                "account_number": master.get("account_number", ""),
+                "iban_number": "",  # Not available in OCR output
+                "opening_balance": 0.0,  # Will be calculated
+                "closing_balance": 0.0,  # Will be calculated
+                "financial_period": "",  # Not available in OCR output
+            }
+
+            # Calculate balances if we have transactions
+            if transactions:
+                # Sort transactions by date
+                transactions.sort(key=lambda x: parse_date_for_sorting(x.date))
+
+                # Calculate running balance
+                current_balance = 0.0
+                for tx in transactions:
+                    current_balance += tx.credit - tx.debit
+                    tx.balance = current_balance
+
+                # Update results with calculated balances
+                results["transactions"] = [
+                    {
+                        "date": tx.date,
+                        "description": tx.description,
+                        "debit": tx.debit,
+                        "credit": tx.credit,
+                        "balance": tx.balance,
+                        "line_number": tx.line_number
+                    }
+                    for tx in transactions
+                ]
+
+                # Set opening and closing balances
+                if transactions:
+                    results["account_info"]["opening_balance"] = transactions[0].balance - (transactions[0].credit - transactions[0].debit)
+                    results["account_info"]["closing_balance"] = transactions[-1].balance
+
+            # Generate analysis if transactions found
             if results["total_transactions"] > 0:
-                monthly_data = self.aggregate_monthly_analysis(transactions)
-                
-                # Convert MonthlyData objects to dictionaries
+                monthly_data = aggregate_monthly_analysis(transactions)
                 results["monthly_analysis"] = {
                     month: {
                         "opening_balance": data.opening_balance,
@@ -488,14 +599,13 @@ class BankStatementExtractor:
                     }
                     for month, data in monthly_data.items()
                 }
-                
-                results["analytics"] = self.calculate_analytics(transactions, monthly_data)
-                print(f"Generated analysis for {len(monthly_data)} months")
+
+                results["analytics"] = calculate_analytics(transactions, monthly_data)
             else:
-                print("No transactions found - skipping analysis")
-                    
+                results["analytics"] = _empty_analytics()
+
         except Exception as e:
-            print(f"Error processing PDF: {e}")
+            print(f"Error processing PDF with OCR: {e}")
             return {"error": str(e)}
 
         results["processing_time"] = f"{time.time() - start:.2f}s"
